@@ -12,9 +12,9 @@ except ImportError:
 
 # --- 配置 ---
 IMAGE_PATH = 'test.png'
-TIMEOUT = 5.0
-MOVEMENT_THRESHOLD = 10
-TEST_ROUNDS = 10  # 测试轮数
+TIMEOUT = 2.0
+MOVEMENT_THRESHOLD = 3
+TEST_ROUNDS = 50  # 测试轮数
 
 # 全局变量
 start_time = 0
@@ -68,6 +68,7 @@ def main():
     
     print("=== 自动化延迟测试 (高精度版) ===")
     print(f"计划进行 {TEST_ROUNDS} 轮测试，请保持鼠标静止...")
+    print("提示: 测试过程中按 ESC 或 q 键可随时停止测试")
 
     # 启动监听 (只启动一次，避免反复创建线程的开销)
     listener = mouse.Listener(on_move=on_move)
@@ -88,13 +89,15 @@ def main():
             
             # 2. 显示黑屏准备
             cv2.imshow(window_name, black_img)
-            cv2.waitKey(1)
+            if cv2.waitKey(1) & 0xFF in [27, ord('q')]:
+                raise KeyboardInterrupt
             
             # 3. 随机等待 (1.0 ~ 2.0秒)，防止预测
-            wait_time = random.uniform(1.0, 2.0)
+            wait_time = random.uniform(0.3, 1.0)
             start_wait = time.perf_counter()
             while time.perf_counter() - start_wait < wait_time:
-                cv2.waitKey(10) # 保持窗口响应，但不要太频繁
+                if cv2.waitKey(10) & 0xFF in [27, ord('q')]: # 保持窗口响应，但不要太频繁
+                    raise KeyboardInterrupt
             
             # 4. 记录基准位置
             start_mouse_pos = mouse_controller.position
@@ -106,7 +109,8 @@ def main():
             # 注意：imshow 后必须接 waitKey 才能刷新窗口，但 waitKey 本身有延迟
             # 我们尽量让计时紧贴着刷新操作
             cv2.imshow(window_name, img)
-            cv2.waitKey(1) # 强制刷新事件循环
+            if cv2.waitKey(1) & 0xFF in [27, ord('q')]: # 强制刷新事件循环
+                raise KeyboardInterrupt
             start_time = time.perf_counter() # 立即计时
             
             waiting_for_response = True # 开启监听判定
@@ -119,7 +123,8 @@ def main():
                 # 极短的 sleep 让出 CPU，避免死循环占用 100% CPU 导致系统卡顿
                 # 但在极高精度要求下，可以去掉 sleep，但这通常会影响系统其他进程
                 # cv2.waitKey(1) 既能处理窗口事件，又能充当 sleep
-                cv2.waitKey(1) 
+                if cv2.waitKey(1) & 0xFF in [27, ord('q')]:
+                    raise KeyboardInterrupt
             
             # 8. 恢复 GC
             gc.enable()
