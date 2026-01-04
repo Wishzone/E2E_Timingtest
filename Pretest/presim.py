@@ -1,160 +1,259 @@
 import time
+import ctypes
 import numpy as np
-import matplotlib.pyplot as plt
 from collections import deque
 from pre import Predictor
+import threading
+import tkinter as tk
+import csv
+from datetime import datetime
 
-# 设置中文显示
-plt.rcParams['font.sans-serif'] = ['SimHei']  # Windows自带的黑体
-plt.rcParams['axes.unicode_minus'] = False    # 解决负号显示问题
+# Windows API 常量
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_ABSOLUTE = 0x8000
 
-# 配置参数
-DELAY_MS = 70        # 系统延迟 (ms)
-DT_MS = 10           # 仿真步长 (ms)
-TOTAL_TIME_SEC = 30  # 总仿真时间 (s)
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
-class Simulation:
-    def __init__(self):
-        self.true_pos = 0.0
-        # 历史缓冲区用于模拟延迟：存储 (simulation_time, position)
-        self.history_buffer = deque() 
-        self.predictor = Predictor()
-        
-        # 用于绘图的数据
-        self.logs = {
-            't': [], 
-            'true': [], 
-            'measured': [], 
-            'predicted': []
-        }
+def get_cursor_pos():
+    pt = POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    return pt.x, pt.y
 
-    def get_delayed_measurement(self, current_sim_time):
-        """
-        模拟获取延迟后的传感器数据
-        返回: (measurement_time, position)
-        """
-        target_time = current_sim_time - (DELAY_MS / 1000.0)
-        
-        # 在缓冲区中找到最接近 target_time 的数据
-        best_match = (0.0, 0.0)
-        found = False
-        
-        # 遍历缓冲区找到符合延迟时间的数据
-        for t, pos in self.history_buffer:
-            if t >= target_time:
-                best_match = (t, pos)
-                found = True
-                break
-        
-        # 如果没找到（比如刚开始），使用最新的数据或者0
-        if not found and self.history_buffer:
-            best_match = self.history_buffer[-1]
+def move_mouse_relative(dx, dy):
+    ctypes.windll.user32.mouse_event(MOUSEEVENTF_MOVE, int(dx), int(dy), 0, 0)
+
+def get_screen_size():
+    w = ctypes.windll.user32.GetSystemMetrics(0)
+    h = ctypes.windll.user32.GetSystemMetrics(1)
+    return w, h
+
+def show_center_marker(center_x, center_y):
+    """在屏幕中心显示一个红点"""
+    def _run():
+        root = tk.Tk()
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        root.attributes("-alpha", 0.7)  # 半透明
+        # 红色圆点(实际上是方块)
+        size = 6
+        root.geometry(f"{size}x{size}+{center_x-size//2}+{center_y-size//2}")
+        label = tk.Label(root, bg="red")
+        label.pack(fill="both", expand=True)
+        root.mainloop()
+    
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+def save_metrics(data):
+    if not data:
+        return
+
+    # 计算统计指标
+    distances = [d['distance'] for d in data]
+    avg_dist = np.mean(distances)
+    max_dist = np.max(distances)
+    rmse = np.sqrt(np.mean(np.array(distances)**2))
+    
+    print("\n" + "="*30)
+    print("测试结果统计")
+    print("="*30)
+    print(f"平均误差距离: {avg_dist:.2f} px")
+    print(f"最大误差距离: {max_dist:.2f} px")
+    print(f"RMSE (均方根误差): {rmse:.2f} px")
+    print(f"总样本数: {len(data)}")
+    print("="*30)
+    
+    # 保存到文件
+    filename = f"metrics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    try:
+        with open(filename, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['timestamp', 'x', 'y', 'error_x', 'error_y', 'distance'])
+            writer.writeheader()
+            writer.writerows(data)
+        print(f"详细数据已保存至: {filename}")
+    except Exception as e:
+        print(f"保存数据失败: {e}")
+
+def main():
+    # 获取屏幕中心
+    w, h = get_screen_size()
+    center_x, center_y = w // 2, h // 2
+    print(f"屏幕分辨率: {w}x{h}, 中心点: ({center_x}, {center_y})")
+    
+    # 显示中心标记
+    show_center_marker(center_x, center_y)
+    
+    print("程序将在3秒后开始控制鼠标...")
+    print("【安全警告】如需停止，请将鼠标快速移动到屏幕左上角 (0,0)")
+    time.sleep(3)
+
+    # 初始化预测器 (X和Y轴分开)
+    pred_x = Predictor()
+    pred_y = Predictor()
+    
+    # 延迟缓冲区
+    # 存储 (timestamp, x, y)
+    history_buffer = deque()
+    
+    # 动作缓冲区：存储已发送但尚未被观测到的控制指令
+    # 存储 (timestamp, dx, dy)
+    action_buffer = deque()
+    
+    DELAY_SEC = 0.070  # 70ms 延迟
+    
+    # 控制参数
+    Kp = 0.3  # 比例增益
+    Ki = 2.0  # 积分增益：用于消除稳态误差
+    
+    # 积分误差累积
+    integral_x = 0.0
+    integral_y = 0.0
+    # 积分限幅 (Anti-windup)，防止积分项过大导致过冲
+    # 限制积分项能贡献的最大速度
+    max_integral_contribution = 3000.0 
+    
+    # 性能指标记录
+    metrics_data = []
+    start_time = time.time()
+    
+    try:
+        while True:
+            current_time = time.time()
             
-        return best_match
-
-    def run(self):
-        print(f"开始仿真: 延迟={DELAY_MS}ms, 步长={DT_MS}ms")
-        sim_time = 0.0
-        
-        # 初始化缓冲区，假设开始前位置都在0
-        for i in range(int(DELAY_MS/DT_MS) + 5):
-            t = - (DELAY_MS/1000.0) + i * (DT_MS/1000.0)
-            self.history_buffer.append((t, 0.0))
-
-        # 设置绘图
-        plt.ion()
-        fig, ax = plt.subplots(figsize=(10, 6))
-        line_true, = ax.plot([], [], 'b-', label='真实位置 (True)', linewidth=2)
-        line_pred, = ax.plot([], [], 'r--', label='预测位置 (Predicted)', alpha=0.7)
-        line_meas, = ax.plot([], [], 'g:', label='延迟观测 (Delayed)', alpha=0.5)
-        
-        ax.set_title(f'70ms 延迟补偿仿真 (PID控制)')
-        ax.set_xlabel('时间 (s)')
-        ax.set_ylabel('位置 (偏离中心点的距离)')
-        ax.legend(loc='upper right')
-        ax.grid(True)
-        
-        # 动态调整坐标轴
-        ax.set_xlim(0, 5)
-        ax.set_ylim(-5, 5)
-
-        try:
-            while sim_time < TOTAL_TIME_SEC:
-                # 1. 模拟环境扰动 (鼠标移动)
-                # 模拟一个持续的移动趋势(正弦波)加上随机抖动
-                disturbance = 3.0 * np.sin(sim_time * 1.0) + np.random.normal(0, 0.5)
+            # 1. 获取真实位置 (模拟传感器读取)
+            real_x, real_y = get_cursor_pos()
+            
+            # 记录指标
+            curr_error_x = real_x - center_x
+            curr_error_y = real_y - center_y
+            curr_dist = np.sqrt(curr_error_x**2 + curr_error_y**2)
+            
+            # 只记录开始控制后的数据（比如前3秒不记录，或者这里直接记录）
+            # 这里我们记录所有数据
+            metrics_data.append({
+                'timestamp': current_time - start_time,
+                'x': real_x,
+                'y': real_y,
+                'error_x': curr_error_x,
+                'error_y': curr_error_y,
+                'distance': curr_dist
+            })
+            
+            # 安全退出检测
+            if real_x < 10 and real_y < 10:
+                print("检测到鼠标在左上角，程序退出。")
+                break
                 
-                # 2. 获取延迟的测量值 (模拟系统只能看到70ms前的数据)
-                meas_time, meas_pos = self.get_delayed_measurement(sim_time)
+            # 2. 存入延迟缓冲区
+            history_buffer.append((current_time, real_x, real_y))
+            
+            # 3. 获取延迟后的观测值
+            # 寻找最接近 current_time - DELAY_SEC 的数据
+            target_time = current_time - DELAY_SEC
+            
+            delayed_data = None
+            # 从旧到新遍历，找到第一个时间 >= target_time 的
+            best_match = None
+            for item in history_buffer:
+                t, x, y = item
+                if t >= target_time:
+                    best_match = item
+                    break
+            
+            # 如果没找到（缓冲区数据都比目标时间旧），取最新的
+            if best_match is None and len(history_buffer) > 0:
+                best_match = history_buffer[-1]
+            elif best_match is None:
+                best_match = (current_time, real_x, real_y)
                 
-                # 3. 预测算法
-                # 将过时的测量值喂给预测器
-                self.predictor.update(meas_time, meas_pos)
+            obs_time, obs_x, obs_y = best_match
+            
+            # 清理过旧的数据 (保留最近 200ms)
+            while len(history_buffer) > 0 and history_buffer[0][0] < current_time - 0.2:
+                history_buffer.popleft()
                 
-                # 预测当前时刻 (sim_time) 的位置
-                # 预测器会根据历史轨迹外推这70ms的变化
-                pred_pos = self.predictor.predict(sim_time)
+            # 4. 预测算法更新
+            pred_x.update(obs_time, obs_x)
+            pred_y.update(obs_time, obs_y)
+            
+            # 5. 预测当前位置
+            # 基础预测：不再进行时间外推，只进行平滑处理
+            # 我们只信任观测到的位置 + 我们自己发出的动作
+            # 如果进行外推，会将我们之前的控制动作误判为外部速度，导致震荡
+            base_est_x = pred_x.predict(obs_time)
+            base_est_y = pred_y.predict(obs_time)
+            
+            # 关键修正：加上所有“已发送但未被观测到”的控制量 (Smith Predictor 思想)
+            # 观测值 obs_time 之后的所有动作，其效果尚未体现在 obs_x/y 中
+            pending_dx = 0
+            pending_dy = 0
+            
+            # 清理过期的动作记录
+            while len(action_buffer) > 0 and action_buffer[0][0] < obs_time:
+                action_buffer.popleft()
                 
-                # 4. 控制系统 (P控制器)
-                # 目标是保持位置为 0
-                # Error = Target - Predicted
-                error = 0.0 - pred_pos
-                
-                # 简单的 P 控制系数
-                # 如果预测准确，这个控制量应该能抵消扰动并将位置拉回0
-                Kp = 1.5 
-                control_action = Kp * error
-                
-                # 5. 更新物理系统
-                # 位置变化 = (扰动速度 + 控制速度) * dt
-                # 这里假设 disturbance 和 control_action 都是速度量纲
-                self.true_pos += (disturbance + control_action) * (DT_MS / 1000.0)
-                
-                # 6. 记录真实状态到缓冲区 (用于未来的延迟测量)
-                self.history_buffer.append((sim_time, self.true_pos))
-                
-                # 清理过长的缓冲区 (保留最近 200ms 数据即可)
-                while len(self.history_buffer) > 0 and self.history_buffer[0][0] < sim_time - 0.2:
-                    self.history_buffer.popleft()
-
-                # 记录日志
-                self.logs['t'].append(sim_time)
-                self.logs['true'].append(self.true_pos)
-                self.logs['measured'].append(meas_pos)
-                self.logs['predicted'].append(pred_pos)
-                
-                # 绘图更新 (每 100ms 更新一次画面)
-                if int(sim_time * 1000) % 100 == 0:
-                    # 保持显示最近5秒的数据
-                    t_data = np.array(self.logs['t'])
-                    start_idx = max(0, len(t_data) - int(5.0 / (DT_MS/1000.0)))
-                    
-                    current_t = t_data[start_idx:]
-                    
-                    line_true.set_data(current_t, self.logs['true'][start_idx:])
-                    line_pred.set_data(current_t, self.logs['predicted'][start_idx:])
-                    line_meas.set_data(current_t, self.logs['measured'][start_idx:])
-                    
-                    ax.set_xlim(max(0, sim_time - 5), max(5, sim_time))
-                    
-                    # 动态调整Y轴
-                    y_data = self.logs['true'][start_idx:]
-                    if len(y_data) > 0:
-                        ymin, ymax = min(y_data), max(y_data)
-                        margin = max(1.0, (ymax - ymin) * 0.2)
-                        ax.set_ylim(ymin - margin, ymax + margin)
-                    
-                    plt.pause(0.001)
-                
-                sim_time += DT_MS / 1000.0
-                # time.sleep(0.001) # 如果需要减慢仿真速度可以取消注释
-                
-        except KeyboardInterrupt:
-            print("仿真中断")
-        
-        plt.ioff()
-        plt.show()
+            # 累加未观测到的动作
+            for t, dx, dy in action_buffer:
+                if t > obs_time:
+                    pending_dx += dx
+                    pending_dy += dy
+            
+            # 最终估计位置 = 基础预测 + 待生效的控制量
+            est_x = base_est_x + pending_dx
+            est_y = base_est_y + pending_dy
+            
+            # 6. 计算控制量
+            # 目标是中心点
+            # Error = Target - Estimated_Current
+            error_x = center_x - est_x
+            error_y = center_y - est_y
+            
+            # 积分项更新 (dt 约为 0.01s)
+            dt = 0.01
+            integral_x += error_x * dt
+            integral_y += error_y * dt
+            
+            # 积分抗饱和 (Clamping)
+            # 限制积分项的数值，防止其无限增长
+            limit_val = max_integral_contribution / Ki
+            integral_x = np.clip(integral_x, -limit_val, limit_val)
+            integral_y = np.clip(integral_y, -limit_val, limit_val)
+            
+            # 死区处理：如果误差很小，清零积分并停止移动，避免在中心点附近抖动
+            if abs(error_x) < 10: 
+                error_x = 0
+                integral_x = 0 # 进入死区后清除积分，避免过冲
+            if abs(error_y) < 10: 
+                error_y = 0
+                integral_y = 0
+            
+            # PI控制 (比例 + 积分)
+            # 积分项会随着时间积累误差，从而提供额外的拉力来消除稳态距离
+            move_x = error_x * Kp + integral_x * Ki
+            move_y = error_y * Kp + integral_y * Ki
+            
+            # 限制单次移动幅度，防止飞出
+            max_step = 50
+            move_x = np.clip(move_x, -max_step, max_step)
+            move_y = np.clip(move_y, -max_step, max_step)
+            
+            # 7. 执行移动 (相对移动)
+            # 只有当误差足够大时才移动，避免抖动
+            if abs(move_x) > 1 or abs(move_y) > 1:
+                int_move_x = int(move_x)
+                int_move_y = int(move_y)
+                move_mouse_relative(int_move_x, int_move_y)
+                # 记录实际发送的整数值，确保模型与现实一致
+                action_buffer.append((time.time(), int_move_x, int_move_y))
+            
+            # 控制循环频率
+            time.sleep(0.01) # ~100Hz
+            
+    except KeyboardInterrupt:
+        print("\n程序已停止")
+    finally:
+        save_metrics(metrics_data)
 
 if __name__ == "__main__":
-    sim = Simulation()
-    sim.run()
+    main()

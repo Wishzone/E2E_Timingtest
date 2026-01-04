@@ -11,10 +11,12 @@ except ImportError:
     sys.exit(1)
 
 # --- 配置 ---
-IMAGE_PATH = 'test.png'
-TIMEOUT = 2.0
-MOVEMENT_THRESHOLD = 3
+IMAGE_PATH = './Timingtest/test.png'
+TIMEOUT = 1.0
+MOVEMENT_THRESHOLD = 1
 TEST_ROUNDS = 50  # 测试轮数
+WINDOW_X = 0      # 窗口显示的起始X坐标 (用于多屏设置，例如副屏在右侧可设为1920)
+WINDOW_Y = 0      # 窗口显示的起始Y坐标
 
 # 全局变量
 start_time = 0
@@ -55,6 +57,7 @@ def main():
     # 准备窗口
     window_name = 'Latency Test'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.moveWindow(window_name, WINDOW_X, WINDOW_Y) # 移动窗口到指定屏幕位置
     cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     # --- 预热阶段 ---
@@ -92,8 +95,8 @@ def main():
             if cv2.waitKey(1) & 0xFF in [27, ord('q')]:
                 raise KeyboardInterrupt
             
-            # 3. 随机等待 (1.0 ~ 2.0秒)，防止预测
-            wait_time = random.uniform(0.3, 1.0)
+            # 3. 随机等待 (0.3 ~ 0.5秒)，防止预测
+            wait_time = random.uniform(0.3, 0.5)
             start_wait = time.perf_counter()
             while time.perf_counter() - start_wait < wait_time:
                 if cv2.waitKey(10) & 0xFF in [27, ord('q')]: # 保持窗口响应，但不要太频繁

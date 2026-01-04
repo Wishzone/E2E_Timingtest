@@ -7,7 +7,7 @@ class Predictor:
         """
         self.history_time = []
         self.history_pos = []
-        self.window_size = 6  # 使用最近6个点进行拟合，增加一点平滑度
+        self.window_size = 10  # 增加窗口大小以平滑噪声
 
     def update(self, timestamp, pos):
         """
@@ -38,6 +38,10 @@ class Predictor:
         t_local = np.array(self.history_time) - t_base
         y = np.array(self.history_pos)
         
+        # 稳定性检测：如果历史窗口内的波动很小（认为是静止或噪声），则不进行外推
+        if np.std(y) < 2.0:
+            return y[-1]
+
         # 简单的最小二乘法拟合一次函数 (假设短时间内速度恒定)
         # A = [t, 1]
         A = np.vstack([t_local, np.ones(len(t_local))]).T
