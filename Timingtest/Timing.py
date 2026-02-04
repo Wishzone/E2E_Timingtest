@@ -14,7 +14,7 @@ except ImportError:
 IMAGE_PATH = './Timingtest/test.png'
 TIMEOUT = 1.0
 MOVEMENT_THRESHOLD = 1
-TEST_ROUNDS = 50  # 测试轮数
+TEST_ROUNDS = 53  # 测试轮数
 WINDOW_X = 0      # 窗口显示的起始X坐标 (用于多屏设置，例如副屏在右侧可设为1920)
 WINDOW_Y = 0      # 窗口显示的起始Y坐标
 
@@ -64,6 +64,7 @@ def main():
     # 首次调用 OpenCV 函数会有加载开销，先运行一次不计入统计
     print("正在预热...")
     black_img = np.zeros_like(img)
+    black_img[:] = (128, 128, 128) # 改为灰色背景，防止过曝
     cv2.imshow(window_name, black_img)
     cv2.waitKey(1)
     cv2.imshow(window_name, img)
@@ -95,8 +96,8 @@ def main():
             if cv2.waitKey(1) & 0xFF in [27, ord('q')]:
                 raise KeyboardInterrupt
             
-            # 3. 随机等待 (0.3 ~ 0.5秒)，防止预测
-            wait_time = random.uniform(0.3, 0.5)
+            # 3. 随机等待 (0.4 ~ 0.6秒)，防止预测
+            wait_time = random.uniform(0.4, 0.6)
             start_wait = time.perf_counter()
             while time.perf_counter() - start_wait < wait_time:
                 if cv2.waitKey(10) & 0xFF in [27, ord('q')]: # 保持窗口响应，但不要太频繁
@@ -146,6 +147,13 @@ def main():
         cv2.destroyAllWindows()
 
     # --- 结果统计 ---
+    # 忽略前3次结果，因为可能有较大的初始化误差
+    ignored_count = 0
+    if len(latencies) > 3:
+        latencies = latencies[3:]
+        ignored_count = 3
+        print(f"\n已自动忽略前 {ignored_count} 次测试结果（预热数据）")
+
     if latencies:
         avg_latency = np.mean(latencies)
         std_dev = np.std(latencies)
@@ -155,7 +163,7 @@ def main():
         print("\n" + "="*30)
         print("       测试结果统计       ")
         print("="*30)
-        print(f"样本数量 : {len(latencies)}")
+        print(f"有效样本 : {len(latencies)}")
         print(f"平均延迟 : {avg_latency:.2f} ms")
         print(f"标准差   : {std_dev:.2f} ms (越小越稳定)")
         print(f"最小延迟 : {min_latency:.2f} ms")
